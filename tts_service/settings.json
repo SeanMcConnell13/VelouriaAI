@@ -1,0 +1,8 @@
+{
+  "model_name": "tts_models/multilingual/multi-dataset/xtts_v2",
+  "use_gpu": true,
+  "language": "en",
+  "sample_rate": 22050,
+  "reference_voice_wav": "C:\\Velouria\\voices\\velouria_ref.wav", 
+  "default_speaker": "female-en-5"
+}
