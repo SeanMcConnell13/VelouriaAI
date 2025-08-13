@@ -3,7 +3,7 @@
 **Push-to-talk voice assistant, fully local.**  
 🎤 ASR (Whisper / faster-whisper) → 🤖 LLM (Ollama) → 🔊 TTS (XTTS) → 🕺 VTube Studio motion — paced so lips + audio stay in sync.
 
-> Hold your mouse side button to talk. Built for snappy, real-time feel on Windows. No cloud keys, no venvs in Git.
+> Hold your mouse side button to talk (Not left or right, but a mouse that has extra buttons, easy to change the default \velouria\src\velouria\settings.json "ptt_button": "x1",). Built for snappy, real-time feel on Windows. No cloud keys, no venvs in Git.
 
 ## What it does (quick)
 - Transcribes mic input fast (prefers `faster-whisper`)
