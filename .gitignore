@@ -1,27 +1,53 @@
-# Virtual environments
+# virtual envs
+venv/
 .venv/
-env/
+
+# python cache/build
+__pycache__/
+*.py[cod]
+*.so
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# env files
+.env
+.env.*
+# virtual envs
+.venv/
 venv/
 
-# VS Code / Visual Studio
-.vscode/
-.vs/
-
-# Python cache
+# python cache/build
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*.so
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
 
-# Ollama model cache
+# local data / models / artifacts
+data/
 ollamamodel/
-
-# Environment files
-.env
-
-# Logs
+voices/
+*.wav
 *.log
 
-# OS cruft
-Thumbs.db
+# IDE/OS
+.vs/
+.vscode/
+.idea/
 .DS_Store
+
+# env/tokens
+.env
+.env.*
+src/velouria/.vts_token.json

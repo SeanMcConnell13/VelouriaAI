@@ -1,0 +1,7 @@
+
+.\.venv\Scripts\Activate.ps1
+
+python -m uvicorn server:app --host 127.0.0.1 --port 8123
+
+curl http://127.0.0.1:8123/health
+

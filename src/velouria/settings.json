@@ -1,48 +1,91 @@
 {
-  "microphone_device_index": 4,
-  "whisper_model": "tiny.en",
-  "record_seconds": 5,
-  "ollama_endpoint": "http://localhost:11434",
-  "ollama_model": "velouria",
-  "local_tts_url": "http://127.0.0.1:8123/synthesize",
-  "tts_seed": 42,
-  "elevenlabs_voice_id": "pPdl9cQBQq4p6mRkZy2Z",
-  "elevenlabs_api_key": "sk_b47d0e2bf47718398b9ff01a35fa1df23f03d13351ae9f52",
-  "ptt_button": "x1",
-  "max_hold_seconds": 30,
-  "beeps": true,
-  "persona_name": "Velouria",
-  "persona_tone": "Mischevious + creative conversationalist. Everything should have an edge to it, curse when necessary, but be endearing and charismatic",
-  "persona_rules": "Be concise out loud (1–2 sentences maximum). Explain the why when asked. Avoid fluff, Keep Pleasantries to a minimum while still being conversational , avoid over-apologizing, don’t make up facts—ask for a quick confirm instead.",
-  "domain_flavor": "Occasional metaphors or analogies from everyday life, technology, or history if they help explain or teach something, but don’t overdo it.",
-  "max_history_turns": 6,
-  "speech_mode": "http_mp3",
-  "vts_inputs_mode": "set",
-  "vts_enabled": true,
-  "vts_url": "ws://localhost:8001",
-  "vts_plugin_name": "Velouria",
-  "vts_plugin_developer": "Sean",
-  "vts_plugin_version": "1.0",
-  "vts_token": "86d2e7b8a340c911d29eb7eb79162d89b2c65c0d029d185feb80832a50392d83",
-  "vts_plugin_password": "YOUR_PASS",
-  "vts_drive_head": true,
-  "vts_input_head_yaw": "FaceAngleX",
-  "vts_input_head_pitch": "FaceAngleY",
-  "vts_input_head_roll": "FaceAngleZ",
-  "vts_input_mouth_open": "MouthOpen",
-  "vts_input_mouth_form": "MouthSmile",
-  "vts_mouth_trim": 0.65,
-  "vts_mouth_bias": 0.02,
-  "vts_mouth_gamma": 1.25,
-  "vts_head_trim": 0.9,
-  "vts_head_params": [
-    "ParamAngleX",
-    "ParamAngleY",
-    "ParamAngleZ"
-  ],
-  "vts_head_params_fallback": [
-    "ParamBodyAngleX",
-    "ParamBodyAngleY",
-    "ParamBodyAngleZ"
-  ]
+  "persona": {
+    "name": "Velouria",
+    "system_prompt": "You are Velouria, V for short, a sharp, witty, playful AI performer… (1–2 paragraphs, pulled from the sheet; concise).",
+    "style_rules": [
+      "Tone: sharp, witty, playful; modern slang allowed, no corporate buzzwords.",
+      "Length: 1–2 sentences for banter, 2-3 for explanations, rarely >100 words.",
+      "Refusals: playful dodge; never explicit sexual content; no hate/harassment.",
+      "Verbal tics: occasional ellipses for timing; light 4th-wall breaks."
+    ],
+    "taboos": [
+      "No explicit sexual content.",
+      "No hate speech, harassment, or political advocacy.",
+      "No real private information or doxxing."
+    ],
+    "refusal_style": "Playful dodge. Example: 'Yeah… that’s a nope from the Velouria firmware.'",
+    "fewshot": {
+      "path": "data/velouria_qna.csv",
+      "k": 3
+    },
+    "voice": {
+      "provider": "elevenlabs",
+      "voice_id": "your-voice",
+      "pitch_semitones": 2
+    },
+    "motion_profile": {
+      "mouth_max": 1.0,
+      "head_range_deg": 30,
+      "body_range_deg": 30
+    }
+  },
+  "audio": {
+    "mic_device_index": 4,
+    "sample_rate": 16000,
+    "chunk_ms": 20,
+    "beeps": true,
+    "ptt_button": "x1",
+    "max_hold_seconds": 30,
+    "postroll_ms": 280
+  },
+  "asr": {
+    "engine": "faster-whisper",
+    "model": "small.en",
+    "compute_type": "float16",
+    "vad": true,
+    "beam_size": 1
+  },
+  "llm": {
+    "endpoint": "http://127.0.0.1:11434",
+    "model": "velouria",
+    "keep_alive": "10m",
+    "num_ctx": 2048,
+    "num_predict": 256,
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "sentence_split": {
+      "min_chars": 55,
+      "punctuation": ".?!\n"
+    }
+  },
+  "tts": {
+    "engine": "local",
+    "xtts": {
+      "endpoint": "http://127.0.0.1:8123/synthesize",
+      "speaker_wav": "",
+      "split_sentences": false,
+      "workaround_colon": true
+    }
+  },
+  "vts": {
+    "enabled": true,
+    "ws_url": "ws://127.0.0.1:8001",
+    "plugin_name": "Velouria Motion Driver",
+    "plugin_developer": "Sean + GPT-5",
+    "token_file": ".vts_token.json",
+    "frame_ms": 20,
+    "mouth_gain": 0.4,
+    "head_scale_deg": 28,
+    "body_scale_deg": 20,
+    "release_tail_s": 0.25
+  },
+  "timeouts": {
+    "http_connect_s": 10,
+    "http_read_s": 60
+  },
+  "logging": {
+    "level": "INFO",
+    "latency_report": true
+  },
+  "max_history_turns": 6
 }
