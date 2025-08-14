@@ -4,9 +4,12 @@
 	"sample_rate": 24000,
 	"speaker": "",
 	"post": {
-		"pitch_semitones": 5,
-		"speed": 1.08,
-		"normalize": false
+		"pitch_semitones": 0,
+		"speed": 1.0,
+		"normalize": true
 	},
-	"reference_voice_wav": "C:/Velouria/voices/reference.wav"
+	"reference_voice_wav": [
+		"C:/Velouria/voices/ref1.wav",
+		"C:/Velouria/voices/ref2.wav",
+	]
 }

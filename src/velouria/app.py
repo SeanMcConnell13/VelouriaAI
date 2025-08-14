@@ -4,26 +4,21 @@ Velouria app:
 Push-to-talk ASR → LLM → TTS with paced playback and audio-driven motion
 injection to VTube Studio via WebSocket.
 
-Flow
-----
-1) Hold mouse side button to record mic
-2) Transcribe with Whisper (faster-whisper preferred)
-3) Stream prompt to Ollama; chunk on punctuation/pauses
-4) Synthesize each chunk to WAV (XTTS), decode to fixed-size frames
-5) Play frames at CHUNK_MS cadence and tap them to the motion loop
-6) Motion loop computes envelope → mouth + head/body pose and injects
-   custom parameters into VTS
+Latency upgrades in this build:
+- HTTP/2 keep-alive AsyncClients (LLM/TTS) with low connect/read timeouts
+- Early clause flush (safe punctuation + commas when long)
+- Prefetch next TTS while current audio plays (concurrent tasks, serialized feed)
+- Lean WAV decode via wave (no pydub) + micro-fades
 """
 
-import os, io, re, json, time, asyncio, unicodedata, threading, collections, random
+import os, io, re, json, time, asyncio, unicodedata, threading, collections, random, wave
 from typing import Optional, Dict, List
 import numpy as np
 import sounddevice as sd
 from pynput import mouse
 import httpx
-from pydub import AudioSegment
-import csv
 import websockets  # WebSocket client for VTS
+import csv
 
 # --- Motion shaping knobs (mouth) -------------------------------------------
 
@@ -31,38 +26,33 @@ MOUTH_OUTPUT_GAIN   = 0.80   # final scale before sending to VTS (post-mapping)
 MOUTH_OUTPUT_OFFSET = 0.00   # bias after scaling
 MOUTH_SOFT_MAX      = 0.60   # software clamp (keeps VTS input from saturating)
 
-MOUTH_CHEW_ENABLE   = True   # optional low-rate modulation to mimic syllables
-MOUTH_CHEW_RATE_HZ  = 4.4
-MOUTH_CHEW_DEPTH    = 0.28   # 0..0.4
+MOUTH_CHEW_ENABLE   = True
+MOUTH_CHEW_RATE_HZ  = 4.0
+MOUTH_CHEW_DEPTH    = 0.35   # 0..0.4
 
-# Plosive/sibilant dip to avoid "hissing mouth-open" moments
 CONSONANT_DUCK_ENABLE  = True
 CONSONANT_RATIO_THRESH = 0.65
 CONSONANT_DUCK_AMOUNT  = 0.55  # 0..0.6
 
-# Envelope and mapping (audio energy → mouth open)
 ENV_ATTACK_MS   = 10.0
 ENV_RELEASE_MS  = 140.0
 MOUTH_KNEE      = 0.38
 MOUTH_CEIL      = 0.95
 
-# Normalization reference (lower → more open on the same audio)
 ENV_NORM_REF    = 0.015
 
-# Global pose scale multipliers
 HEAD_SCALE_MULT = 1.00
 BODY_SCALE_MULT = 1.00
 
-# Queues, pacing, logging
-FRAME_QUEUE_MAX = 3           # small on purpose; latest-wins
+FRAME_QUEUE_MAX = 3
 VTS_SEND_TIMEOUT_MS = 25
 LOG_EVERY_SEC = 1.0
 
-# LLM early-flush thresholds (feel snappier)
-EARLY_FLUSH_MIN_CHARS = 14
-EARLY_FLUSH_MAX_STALL_MS = 600
+# LLM early-flush thresholds
+EARLY_FLUSH_MIN_CHARS = 48
+EARLY_FLUSH_MAX_STALL_MS = 1100
+CLAUSE_MAX_CHARS = 140  # if buffer grows beyond this, allow comma-split
 
-# Extra mouth gain on top of VTS_MOUTH_GAIN from settings
 MOUTH_EXTRA_GAIN = 1.35
 
 # --- Settings ---------------------------------------------------------------
@@ -83,7 +73,7 @@ PTT_BUTTON = (AUDIO.get("ptt_button", "x1") or "x1").lower()
 MAX_HOLD = int(AUDIO.get("max_hold_seconds", 30))
 BEEPS = bool(AUDIO.get("beeps", True))
 
-# ASR preferences (faster-whisper if available)
+# ASR preferences
 ASR_CFG = settings.get("asr", {})
 ASR_ENGINE = ASR_CFG.get("engine", "faster-whisper")
 ASR_MODEL = ASR_CFG.get("model", "small.en")
@@ -91,7 +81,7 @@ ASR_COMPUTE = ASR_CFG.get("compute_type", "float16")
 ASR_VAD = bool(ASR_CFG.get("vad", True))
 ASR_BEAM_SIZE = int(ASR_CFG.get("beam_size", 1))
 
-USE_TTS_STREAM = False  # currently using request/response WAV
+USE_TTS_STREAM = False  # request/response WAV
 
 # LLM (Ollama)
 LLM = settings.get("llm", {})
@@ -116,11 +106,10 @@ TTS_SPEAKER_WAV = (XTTS.get("speaker_wav") or "").strip()
 
 # HTTP timeouts and logging
 TO = settings.get("timeouts", {})
-HTTP_CONNECT_S = float(TO.get("http_connect_s", 10))
-HTTP_READ_S = float(TO.get("http_read_s", 60))
+HTTP_CONNECT_S = float(TO.get("http_connect_s", 5))   # ↓ snappier
+HTTP_READ_S    = float(TO.get("http_read_s", 30))     # ↓ snappier
 LATENCY_REPORT = bool(settings.get("logging", {}).get("latency_report", True))
 
-# Short rolling history for persona memory
 MEMORY_PATH = os.path.join(BASE_DIR, "memory.json")
 MAX_TURNS = int(settings.get("max_history_turns", 6))
 
@@ -138,17 +127,27 @@ VTS_PLUGIN_NAME = VTS_CFG.get("plugin_name", "Velouria Motion Driver")
 VTS_PLUGIN_DEV = VTS_CFG.get("plugin_developer", "Sean + GPT-5")
 VTS_TOKEN_PATH = os.path.join(BASE_DIR, VTS_CFG.get("token_file", ".vts_token.json"))
 
-# Playback tails (keeps lips moving briefly between chunks)
+# Playback tails
 POSTROLL_MS = int(settings.get("audio", {}).get("postroll_ms", 120))
 INTER_SENTENCE_GAP_MS = int(settings.get("audio", {}).get("intersentence_gap_ms", 60))
 
 # Persistent audio/motion singletons
 _MOTION = {"queue": None, "task": None, "audio": None, "sr": 24000}
 
+# Low-latency mode for first clause (keeps model hot & prompt short)
+LL_FAST = settings.get("fast_first_audio", {})
+FAST_FIRST_ENABLED = bool(LL_FAST.get("enabled", True))
+FAST_MAX_TURNS = int(LL_FAST.get("max_history_turns", 2))   # summarize/pick last turns
+FAST_FEWSHOT_K  = int(LL_FAST.get("fewshot_k", 1))          # 0 or 1 is best for speed
+FAST_NUM_CTX    = int(LL_FAST.get("num_ctx", 1024))         # lower = faster TTFT
+FAST_SYSTEM_BRIEF = LL_FAST.get(
+    "system_brief",
+    "Be concise. Start your reply with a short, self-contained sentence."
+)
+
 # --- Audio ring buffer + callback output ------------------------------------
 
 class AudioRing:
-    """Thread-safe FIFO of float32 audio frames used by the callback."""
     def __init__(self, frame_samples: int):
         self.frame_samples = frame_samples
         self.q = collections.deque()
@@ -168,10 +167,6 @@ class AudioRing:
             return len(self.q)
 
 class CallbackOutput:
-    """
-    Single-channel OutputStream that reads from AudioRing.
-    Optionally taps frames into an asyncio queue for the motion loop.
-    """
     def __init__(self, samplerate: int, frame_ms: int):
         self.sr = int(samplerate)
         self.frame_samples = max(1, int(self.sr * (frame_ms / 1000.0)))
@@ -186,16 +181,14 @@ class CallbackOutput:
             samplerate=self.sr,
             channels=1,
             dtype="float32",
-            blocksize=self.frame_samples,
+            blocksize=self.frame_samples,  # ~20ms at sr=24k
             latency='low',
             callback=self._cb
         )
     def set_tap(self, loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[np.ndarray]"):
-        """Enable motion tapping by wiring an asyncio queue + loop."""
         self._tap_loop = loop
         self._tap_queue = queue
     def _offer_to_tap(self, frame: np.ndarray):
-        """Non-blocking offer to the tap queue (drop oldest on overflow)."""
         q = self._tap_queue
         if q is None:
             return
@@ -222,7 +215,6 @@ class CallbackOutput:
             self._tap_dropped = 0
             self._tap_last_log = now
     def _cb(self, outdata, frames, time_info, status):
-        """PortAudio callback. Fills with next frame or silence."""
         frame = self.ring.pop()
         if frame is None:
             out = np.zeros((frames,), dtype=np.float32)
@@ -236,7 +228,6 @@ class CallbackOutput:
         if self._tap_queue is not None and self._tap_loop is not None:
             self._tap_loop.call_soon_threadsafe(self._offer_to_tap, out.copy())
     def drain(self, max_wait_s: Optional[float] = None, frame_ms: int = 20):
-        """Let playback finish gracefully (optionally bounded)."""
         start = time.time()
         while self.ring.depth() > 0:
             time.sleep(max(0.001, frame_ms / 1000.0))
@@ -258,14 +249,12 @@ hold_lock = threading.Lock()
 is_holding = False
 
 def beep(freq=880, ms=90):
-    """Optional UI beep for state changes."""
     if not BEEPS: return
     t = np.linspace(0, ms/1000, int(SAMPLE_RATE*ms/1000), False)
     tone = 0.12*np.sin(2*np.pi*freq*t).astype(np.float32)
     sd.play(tone, SAMPLE_RATE); sd.wait()
 
 def ensure_input_device(device_index):
-    """Validate input device index early; fail loud if misconfigured."""
     try:
         info = sd.query_devices(device_index)
         if info["max_input_channels"] < 1:
@@ -275,12 +264,10 @@ def ensure_input_device(device_index):
         print(sd.query_devices()); raise SystemExit("Fix settings.json audio.mic_device_index")
 
 def _pynput_button_from_str(s: str):
-    """Map settings string to pynput mouse button."""
     from pynput import mouse as _pm
     return _pm.Button.x2 if s == "x2" else _pm.Button.x1
 
 def start_ptt_listener():
-    """Background listener that tracks the side-button hold state."""
     target = _pynput_button_from_str(PTT_BUTTON)
     def on_click(x, y, button, pressed):
         global is_holding
@@ -298,14 +285,12 @@ def load_memory():
     except Exception: return []
 
 def save_memory(history):
-    """Persist a small rolling conversation window."""
     try:
         with open(MEMORY_PATH, "w", encoding="utf-8") as f:
             json.dump(history[-MAX_TURNS:], f, ensure_ascii=False, indent=2)
     except Exception: pass
 
 def _load_style_pack_csv(path: str) -> List[Dict[str, str]]:
-    """Load persona few-shot examples from CSV with 'instruction','output'."""
     rows = []
     try:
         with open(path, newline="", encoding="utf-8") as f:
@@ -321,28 +306,44 @@ def _load_style_pack_csv(path: str) -> List[Dict[str, str]]:
 
 _STYLE_PACK_CACHE = None
 def _get_style_pack_rows() -> List[Dict[str, str]]:
-    """Cache the CSV because we sample randomly per prompt."""
     global _STYLE_PACK_CACHE
     if _STYLE_PACK_CACHE is None:
         _STYLE_PACK_CACHE = _load_style_pack_csv(settings.get("persona", {}).get("fewshot", {}).get("path", "data/velouria_qna.csv"))
     return _STYLE_PACK_CACHE
 
-def build_fewshot_block(k: int = None) -> str:
-    """Pick k random persona exemplars as few-shot context."""
+def build_fewshot_block(k: int = None, fast: bool = False) -> str:
     rows = _get_style_pack_rows()
-    if not rows: return ""
-    kk = int(settings.get("persona", {}).get("fewshot", {}).get("k", 3) if k is None else k)
-    kk = max(0, min(kk, len(rows)))
-    if kk == 0: return ""
+    if not rows:
+        return ""
+    if fast:
+        kk = max(0, min(FAST_FEWSHOT_K, len(rows)))
+    else:
+        kk = int(settings.get("persona", {}).get("fewshot", {}).get("k", 3) if k is None else k)
+        kk = max(0, min(kk, len(rows)))
+    if kk == 0:
+        return ""
     shuffled = rows[:]; random.shuffle(shuffled); chosen = shuffled[:kk]
-    lines = []
-    for r in chosen:
-        lines.append(f"User: {r['instruction']}")
-        lines.append(f"Assistant: {r['output']}")
-    return "\n".join(lines) + "\n\n"
+    return "\n".join([f"User: {r['instruction']}\nAssistant: {r['output']}" for r in chosen]) + "\n\n"
 
-def build_system_prompt(persona):
-    """Compose persona system content with style/taboos/refusal notes."""
+def build_prompt_with_history(user_text, history, fast: bool = False):
+    lines = []
+    turns = history[-(FAST_MAX_TURNS if fast else MAX_TURNS):]
+    for turn in turns:
+        u = (turn.get("user") or "").strip()
+        a = (turn.get("assistant") or "").strip()
+        if u: lines.append(f"User: {u}")
+        if a: lines.append(f"Assistant: {a}")
+    lines.append(f"User: {user_text.strip()}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+def build_system_prompt(persona, fast: bool = False):
+    if fast:
+        # ultra-brief system for fast first token
+        base = persona.get('system_prompt', '')
+        name = persona.get('name', 'Velouria')
+        return f"{FAST_SYSTEM_BRIEF} Stay in character as {name}."
+    # original verbose system
     rules = "\n".join(f"- {r}" for r in persona.get("style_rules", []))
     taboos = "\n".join(f"- {t}" for t in persona.get("taboos", []))
     return (
@@ -353,17 +354,6 @@ def build_system_prompt(persona):
         f"Stay in character as {persona.get('name', 'Velouria')}."
     )
 
-def build_prompt_with_history(user_text, history):
-    """Interleave recent turns and the new user line."""
-    lines = []
-    for turn in history[-MAX_TURNS:]:
-        u = (turn.get("user") or "").strip()
-        a = (turn.get("assistant") or "").strip()
-        if u: lines.append(f"User: {u}")
-        if a: lines.append(f"Assistant: {a}")
-    lines.append(f"User: {user_text.strip()}")
-    lines.append("Assistant:")
-    return "\n".join(lines)
 
 # --- ASR ---------------------------------------------------------------------
 
@@ -376,7 +366,6 @@ except Exception:
     import whisper as openai_whisper
 
 class ASREngine:
-    """Select faster-whisper if possible; otherwise fall back to openai/whisper."""
     def __init__(self):
         self.engine = ASR_ENGINE
         if _FASTER_OK and self.engine == "faster-whisper":
@@ -393,7 +382,6 @@ class ASREngine:
         except Exception:
             self.model = openai_whisper.load_model(ASR_MODEL, device="cpu")
     def transcribe_np16(self, audio_i16: np.ndarray, sr: int) -> str:
-        """Transcribe int16 mono buffer to text."""
         if audio_i16.ndim > 1: audio_i16 = audio_i16.reshape(-1)
         audio_f32 = (audio_i16.astype(np.float32) / 32768.0)
         if _FASTER_OK and self.engine == "faster-whisper":
@@ -403,13 +391,12 @@ class ASREngine:
             result = self.model.transcribe(audio_f32, language="en")
             return (result.get("text") or "").strip()
 
-# --- Text sanitization -------------------------------------------------------
+# --- Text sanitization & boundary finding -----------------------------------
 
 _EMOJI_RE = re.compile("[" "\U0001F300-\U0001FAFF" "\U00002700-\U000027BF" "\U00002600-\U000026FF" "]+", re.UNICODE)
 _ALLOWED_CHARS_RE = re.compile(r"[^a-zA-Z0-9\s\.\,\!\?\;\:\-\'\"/()]+", re.UNICODE)
 
 def sanitize_text(s: str) -> str:
-    """Normalize punctuation, strip emojis/control chars, shrink whitespace."""
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
     s = s.replace("—", "-").replace("–", "-")
@@ -418,13 +405,64 @@ def sanitize_text(s: str) -> str:
     s = _ALLOWED_CHARS_RE.sub(" ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+ABBREV = {
+    "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "st.", "vs.",
+    "etc.", "e.g.", "i.e.", "p.s.", "u.s.", "u.s.a.", "a.m.", "p.m."
+}
+_BOUNDARY_RE = re.compile(r'[.!?]["\')\]]?\s*$', re.IGNORECASE)
+_BOUNDARY_ALL = re.compile(r'[.!?]["\')\]]?\s+')
+
+def _balanced_context(s: str) -> bool:
+    stack = []
+    in_quote = None
+    for ch in s:
+        if ch in ('"', '“', '”', '’', '‘', "'"):
+            if in_quote is None:
+                in_quote = ch
+            elif ch == in_quote or (in_quote in ('“','"') and ch in ('”','"')) or (in_quote in ('‘',"'") and ch in ('’',"'")):
+                in_quote = None
+            continue
+        if in_quote:
+            continue
+        if ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack or {'(':')','[':']','{':'}'}[stack[-1]] != ch:
+                return False
+            stack.pop()
+    return in_quote is None and not stack
+
+def find_last_safe_boundary(s: str) -> int:
+    last = -1
+    for m in _BOUNDARY_ALL.finditer(s):
+        end_idx = m.end()
+        cand = s[:end_idx].rstrip()
+        tail = cand.split()[-1].lower().rstrip('"\')].,!?')
+        if tail in ABBREV:
+            continue
+        if _balanced_context(cand):
+            last = end_idx
+    if last < 0 and _BOUNDARY_RE.search(s):
+        cand = s.rstrip()
+        tail = cand.split()[-1].lower().rstrip('"\')].,!?')
+        if tail not in ABBREV and _balanced_context(cand):
+            return len(cand)
+    return last
+
+def find_last_clause_boundary(s: str) -> int:
+    """Allow comma/semicolon split for long clauses (snappier starts)."""
+    if len(s) < CLAUSE_MAX_CHARS:
+        return -1
+    # Prefer last comma/semicolon followed by space
+    idx = max(s.rfind(", "), s.rfind("; "))
+    # require a decent clause length to avoid staccato
+    if idx >= int(0.5 * CLAUSE_MAX_CHARS):
+        return idx + 2  # include the space
+    return -1
+
 # --- Recording ---------------------------------------------------------------
 
 def record_audio_while_held_np16() -> Optional[np.ndarray]:
-    """
-    Record mic as long as the configured side button is held.
-    Returns mono int16 samples or None if nothing captured.
-    """
     dev = ensure_input_device(MIC_DEVICE_INDEX)
     print("🎙️ Hold side button…"); frames = []; start_ts = None
     def callback(indata, frames_count, time_info, status):
@@ -446,7 +484,6 @@ def record_audio_while_held_np16() -> Optional[np.ndarray]:
 # --- Warmup ------------------------------------------------------------------
 
 async def warmup(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncClient, asr: ASREngine):
-    """Touch ASR/TTS/LLM once so the first user turn isn't cold."""
     try:
         zeros = np.zeros((SAMPLE_RATE//2,), dtype=np.int16); _ = asr.transcribe_np16(zeros, SAMPLE_RATE)
     except Exception: pass
@@ -459,38 +496,49 @@ async def warmup(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncClient, a
         await client_llm.post(f"{OLLAMA_ENDPOINT}/api/generate", json=payload, timeout=httpx.Timeout(HTTP_READ_S, connect=HTTP_CONNECT_S))
     except Exception: pass
 
-# --- WAV → frames ------------------------------------------------------------
+# --- WAV → frames (lean, no pydub) ------------------------------------------
+
+def _apply_fades(x: np.ndarray, sr: int, ms: float = 6.0) -> np.ndarray:
+    n = x.size
+    if n == 0:
+        return x
+    k = max(1, int(sr * (ms / 1000.0)))
+    k = min(k, n // 3)
+    if k > 0:
+        ramp = np.linspace(0.0, 1.0, num=k, endpoint=True, dtype=np.float32)
+        x[:k] *= ramp
+        x[-k:] *= ramp[::-1]
+    return x
 
 def decode_wav_to_frames(body: bytes, out_sr: int, frame_samples: int) -> List[np.ndarray]:
     """
-    Decode WAV bytes to mono float32 frames at out_sr.
-    Pads last frame so all frames are exactly frame_samples long.
+    Fast PCM16 mono decode using wave; linear resample when needed.
+    Pads the last frame to exact length and applies tiny fades.
     """
-    seg = AudioSegment.from_file(io.BytesIO(body), format="wav")
-    src_sr = int(seg.frame_rate)
-    ch = int(seg.channels)
-    sw = int(seg.sample_width)
+    with wave.open(io.BytesIO(body), "rb") as wf:
+        ch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        src_sr = wf.getframerate()
+        nframes = wf.getnframes()
+        raw = wf.readframes(nframes)
 
-    a = np.array(seg.get_array_of_samples(), dtype=np.float32)
+    if sw != 2:  # only PCM16 path for speed
+        return []
+
+    a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     if ch > 1:
-        a = a.reshape((-1, ch)).mean(axis=1)
-
-    # normalize to [-1, 1]
-    if sw == 2:
-        a = a / 32768.0
-    elif sw == 1:
-        a = (a - 128.0) / 128.0
+        a = a.reshape(-1, ch).mean(axis=1)
     else:
-        peak = float(np.max(np.abs(a))) if a.size else 1.0
-        a = a / (peak + 1e-9)
+        a = a.reshape(-1)
 
-    # resample (linear) if needed
     if src_sr != out_sr and a.size:
         n_src = a.size
         n_dst = max(1, int(round(n_src * (out_sr / float(src_sr)))))
         x_src = np.linspace(0.0, 1.0, num=n_src, endpoint=False, dtype=np.float32)
         x_dst = np.linspace(0.0, 1.0, num=n_dst, endpoint=False, dtype=np.float32)
         a = np.interp(x_dst, x_src, a).astype(np.float32, copy=False)
+
+    a = _apply_fades(a, out_sr, ms=6.0)
 
     frames: List[np.ndarray] = []
     i = 0
@@ -521,10 +569,6 @@ def _vts_save_token(path: str, token: str) -> None:
 # --- VTS client --------------------------------------------------------------
 
 class VTSClient:
-    """
-    Minimal VTube Studio RPC client with auto-auth and soft reconnect.
-    Provides an inject_inline() helper for per-frame parameter writes.
-    """
     def __init__(self, url: str, plugin_name: str, plugin_dev: str, token_path: str):
         self.url = url; self.plugin_name = plugin_name; self.plugin_dev = plugin_dev
         self.token_path = token_path
@@ -550,7 +594,6 @@ class VTSClient:
             self._reader_task = asyncio.create_task(self._reader_loop())
 
     async def _reconnect_soft(self):
-        """Close/reopen the socket and redo auth, with a small backoff."""
         now = time.time()
         if now < self._next_reconnect_ts: return
         self._next_reconnect_ts = now + 0.5
@@ -565,7 +608,6 @@ class VTSClient:
             print(f"[VTS] soft reconnect failed: {type(e).__name__}: {e!r}")
 
     async def close(self):
-        """Tear everything down and fail any waiting RPCs."""
         self._running = False
         try:
             if self.ws: await self.ws.close()
@@ -581,7 +623,6 @@ class VTSClient:
         self.authed = False
 
     async def _reader_loop(self):
-        """Read messages, resolve futures, track auth state, print errors."""
         try:
             while self._running and self.ws is not None:
                 raw = await self.ws.recv()
@@ -607,7 +648,6 @@ class VTSClient:
             self.authed = False
 
     async def rpc(self, message_type: str, data: Dict, timeout: float = 3.0) -> Dict:
-        """Send a typed RPC and await its response with a timeout."""
         async with self._rpc_lock:
             if self.ws is None: await self.connect()
             self._req_id += 1; rid = str(self._req_id)
@@ -624,7 +664,6 @@ class VTSClient:
         return await asyncio.wait_for(fut, timeout=timeout)
 
     async def _handshake_and_auth(self):
-        """Obtain or reuse a plugin token and authenticate."""
         if not self._last_token:
             tok_resp = await self.rpc("AuthenticationTokenRequest", {
                 "pluginName": self.plugin_name, "pluginDeveloper": self.plugin_dev
@@ -654,14 +693,10 @@ class VTSClient:
         self.authed = True
 
     async def ensure_ready(self):
-        """Connect + authenticate if needed."""
         if self.ws is None: await self.connect()
         if not self.authed: await self._handshake_and_auth()
 
     async def inject_inline(self, param_values: Dict[str, float], weight: float = 1.0):
-        """
-        Fast path for per-frame parameter writes (single InjectParameterDataRequest).
-        """
         pvals = [{"id": k, "value": float(v), "weight": float(weight)} for k, v in param_values.items()]
         payload = {"apiName":"VTubeStudioPublicAPI","apiVersion":"1.0",
                    "requestID": str(int(time.time()*1000)&0x7FFFFFFF),
@@ -683,7 +718,6 @@ class VTSClient:
             print(f"[VTS] inline send unexpected: {type(e).__name__}: {e!r}")
 
 async def vts_ensure_custom_params(vts: "VTSClient"):
-    """Create the custom tracking params the rig expects (idempotent)."""
     required = [
         ("VelMouthOpen", 0.0, 1.0, 0.0, "Velouria mouth open (0..1)"),
         ("VelFaceAngleX", -30.0, 30.0, 0.0, "Velouria head angle X (deg)"),
@@ -706,7 +740,6 @@ async def vts_ensure_custom_params(vts: "VTSClient"):
 # --- Motion helpers ----------------------------------------------------------
 
 def _map_mouth(envelope: float, ceil: float = MOUTH_CEIL, knee: float = MOUTH_KNEE) -> float:
-    """Nonlinear curve: gentle near zero, faster rise after the knee."""
     e = float(np.clip(envelope, 0.0, 1.0))
     if e <= 1e-6: return 0.0
     if e < knee:
@@ -716,7 +749,6 @@ def _map_mouth(envelope: float, ceil: float = MOUTH_CEIL, knee: float = MOUTH_KN
     return x * ceil
 
 class SmoothParam:
-    """Critically/under-damped 2nd-order smoother (feels like spring-mass)."""
     def __init__(self, omega: float, zeta: float = 1.0, y0: float = 0.0):
         self.omega = float(omega); self.zeta = float(zeta); self.y = float(y0); self.v = 0.0
     def reset(self, y0: float = 0.0):
@@ -728,10 +760,6 @@ class SmoothParam:
         return self.y
 
 class SpeechEnvelope:
-    """
-    RMS envelope with attack/release smoothing and DC removal.
-    Produces a stable 0..~1-ish loudness measure from float32 audio.
-    """
     def __init__(self, sr: int, atk_ms: float = ENV_ATTACK_MS, rel_ms: float = ENV_RELEASE_MS):
         self.sr = float(sr)
         self.alpha_up = np.exp(-1.0 / max(1.0, (atk_ms/1000.0) * self.sr))
@@ -742,7 +770,7 @@ class SpeechEnvelope:
             self.env *= self.alpha_dn
             return self.env
         x = frame.astype(np.float32, copy=False).reshape(-1)
-        x = x - float(np.mean(x))  # DC removal is important when tapping DAC
+        x = x - float(np.mean(x))
         rms = float(np.sqrt(np.mean(x * x) + 1e-12))
         a = self.alpha_up if rms > self.env else self.alpha_dn
         self.env = a * self.env + (1.0 - a) * rms
@@ -750,12 +778,11 @@ class SpeechEnvelope:
     def reset(self):
         self.env = 0.0
 
-# --- Motion consumer (driven by tapped audio) --------------------------------
+# --- Motion consumer (audio-driven) -----------------------------------------
 
 _VTS_SINGLETON = {"client": None, "ready": False}
 
 async def get_vts():
-    """Singleton VTS client with ready-checked auth + parameter creation."""
     if not VTS_ENABLED: return None
     if _VTS_SINGLETON["client"] is None:
         _VTS_SINGLETON["client"] = VTSClient(VTS_WS_URL, VTS_PLUGIN_NAME, VTS_PLUGIN_DEV, VTS_TOKEN_PATH)
@@ -769,12 +796,6 @@ async def get_vts():
     return _VTS_SINGLETON["client"]
 
 async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
-    """
-    Consume audio frames from the output tap and drive VTS parameters.
-    Uses a talk/idle state machine, noise-floor tracking, consonant ducking,
-    and a little "chew" modulation for life.
-    """
-    # Pull tunables from globals but tolerate missing ones (sane defaults).
     CHUNK_MS_L         = globals().get("CHUNK_MS", 20)
     ENV_NORM_REF_L     = float(globals().get("ENV_NORM_REF", 0.04))
     AUTO_NORM_GAIN_L   = float(globals().get("AUTO_NORM_GAIN", 0.80))
@@ -797,7 +818,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
     DUCK_AMT   = float(globals().get("CONSONANT_DUCK_AMOUNT", 0.33))
 
     if not globals().get("VTS_ENABLED", True):
-        # Drain and exit cleanly if motion is disabled
         while True:
             item = await frame_queue.get()
             if item is None:
@@ -807,7 +827,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
     vts = await get_vts()
     print(f"[VTS] motion loop started (audio-driven, sr={samplerate}, frame≈{CHUNK_MS_L}ms).")
 
-    # Smoothers (mouth a bit underdamped for snappier feel)
     mouth_s   = SmoothParam(omega=26.0, zeta=0.80, y0=0.0)
     head_x_s  = SmoothParam(omega=8.5,  zeta=1.00, y0=0.0)
     head_y_s  = SmoothParam(omega=8.5,  zeta=1.00, y0=0.0)
@@ -816,38 +835,29 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
     body_y_s  = SmoothParam(omega=4.0,  zeta=1.00, y0=0.0)
     body_z_s  = SmoothParam(omega=3.8,  zeta=1.00, y0=0.0)
 
-    # Envelope detectors (main + a slightly different one for consonants)
     try:
-        envdet = SpeechEnvelope(sr=samplerate, atk_ms=ENV_ATTACK_MS, rel_ms=ENV_RELEASE_MS, hp_alpha=0.97)
-    except (TypeError, NameError):
-        try:
-            envdet = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=120.0, hp_alpha=0.97)
-        except TypeError:
-            envdet = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=120.0)
+        envdet = SpeechEnvelope(sr=samplerate, atk_ms=ENV_ATTACK_MS, rel_ms=ENV_RELEASE_MS)
+    except Exception:
+        envdet = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=120.0)
 
     ANGLE_MIN, ANGLE_MAX = -30.0, 30.0
     MOUTH_MIN, MOUTH_MAX = 0.0, 1.0
 
     try:
-        conson_env = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=80.0, hp_alpha=0.995)
-    except (TypeError, NameError):
-        try:
-            conson_env = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=80.0)
-        except TypeError:
-            conson_env = envdet
+        conson_env = SpeechEnvelope(sr=samplerate, atk_ms=6.0, rel_ms=80.0)
+    except Exception:
+        conson_env = envdet
 
     chew_phase = 0.0
     rng = np.random.default_rng()
     frame_len = max(1, int(round(samplerate * (CHUNK_MS_L / 1000.0))))
     silence = np.zeros((frame_len,), dtype=np.float32)
 
-    # Centers recenter slowly when quiet
     t0 = time.monotonic()
     head_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     body_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-    recenter_tc = 0.8  # seconds
+    recenter_tc = 0.8
 
-    # Noise floor tracking and peak-based normalization
     noise_floor = 0.0
     NOISE_ALPHA = 0.004
     NOISE_MARGIN = 1.25
@@ -857,7 +867,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
     peak_env = 1e-6
     peak_decay_tc = 0.75
 
-    # Talk/idle with hysteresis + watchdogs for true silence
     ACTIVATE_THR = 0.10
     DEACTIVATE_THR = 0.04
     ACTIVATE_HANG_S = 0.06
@@ -880,7 +889,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
 
     try:
         while True:
-            # Try to keep cadence; fill with silence if tap is starved
             try:
                 frame = await asyncio.wait_for(frame_queue.get(), timeout=0.08)
                 if frame is None:
@@ -904,13 +912,11 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
             raw_env = envdet.process(frame)
             now = time.monotonic()
 
-            # Zero-PCM watchdog (helps when audio truly stops)
             if np.max(np.abs(frame)) <= 1e-9:
                 zero_pcm_streak += dt
             else:
                 zero_pcm_streak = 0.0
 
-            # Track a moving noise floor and subtract it from envelope
             is_noise_like = raw_env <= (max(noise_floor, 1e-6) * NOISE_MARGIN)
             if is_noise_like:
                 noise_floor = (1.0 - NOISE_ALPHA) * noise_floor + NOISE_ALPHA * raw_env
@@ -918,13 +924,11 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
                 noise_floor *= (1.0 - NOISE_DECAY_WHEN_LOUD)
             raw_env_adj = max(0.0, raw_env - SUBTRACT_FACTOR * noise_floor)
 
-            # Normalize by a slow peak to keep dynamics stable
             peak_decay = np.exp(-dt / max(1e-3, peak_decay_tc))
             peak_env = max(raw_env_adj, peak_env * peak_decay)
             dyn_ref = max(ENV_NORM_REF_L, AUTO_NORM_GAIN_L * peak_env)
             norm_env = float(np.clip(raw_env_adj / max(dyn_ref, 1e-6), 0.0, 1.0))
 
-            # Brief sustain across micro-gaps
             speech_active_until = getattr(motion_consumer, "_speech_active_until", 0.0)
             if norm_env > 0.015:
                 speech_active_until = now + 0.09
@@ -934,7 +938,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
                 norm_env = 0.0
             motion_consumer._speech_active_until = speech_active_until
 
-            # Talk/idle with hysteresis
             if norm_env >= ACTIVATE_THR:
                 if above_since is None:
                     above_since = now
@@ -949,7 +952,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
                     peak_env = 1e-6
                     speech_active_until = now
 
-            # Force idle if envelope stays tiny or PCM is zeros
             if raw_env_adj <= LOW_ENV:
                 low_env_streak += dt
             else:
@@ -963,7 +965,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
                 low_env_streak = 0.0
                 zero_pcm_streak = 0.0
 
-            # Mouth target with consonant duck + chew modulation
             if talking:
                 env_for_mouth = np.clip(norm_env, 0.0, 1.0) ** 0.80
                 mouth_target = _map_mouth(env_for_mouth, ceil=MOUTH_CEIL_L, knee=MOUTH_KNEE_L)
@@ -978,16 +979,14 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
                 if CHEW_EN:
                     speech_drive = np.sqrt(norm_env)
                     chew_phase += 2*np.pi * CHEW_RATE * dt * (0.6 + 0.4*speech_drive)
-                    mod  = 0.5 * (1.0 + np.sin(chew_phase))   # 0..1
-                    mouth_target *= (1.0 - (CHEW_DEPTH * (1.0 - mod)))
+                    mod  = 0.5 * (1.0 + np.sin(chew_phase))
+                    mouth_target *= (1.0 - (MOUTH_CHEW_DEPTH * (1.0 - mod)))
             else:
                 mouth_target = 0.0
 
-            # Final software-side shaping to match VTS input ranges
             mouth_target = (mouth_target * MOUTH_OUTPUT_GAIN_L) + MOUTH_OUTPUT_OFFSET_L
             mouth_target = float(np.clip(mouth_target, 0.0, MOUTH_SOFT_MAX_L))
 
-            # Expressiveness: idle sway + jitter, scaled by speech drive
             speech_drive = np.sqrt(norm_env) if talking else 0.0
             talk_boost   = (1.0 + 1.2 * speech_drive) if talking else 1.0
             idle_mix     = (0.6 * (1.0 - speech_drive)) if talking else 1.0
@@ -1008,18 +1007,15 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
             by_n = rng.normal(0.0, 1.0) * 0.26 * jitter
             bz_n = rng.normal(0.0, 1.0) * 0.24 * jitter
 
-            # Recenter slowly when quiet
-            rec_k = 1.0 - np.exp(-dt / recenter_tc)
+            rec_k = 1.0 - np.exp(-dt / 0.8)
             if not talking or norm_env < 0.05:
                 head_center *= (1.0 - rec_k)
                 body_center *= (1.0 - rec_k)
 
-            # Pose amplitudes
             base_h = 0.40; base_b = 0.45
             amp_h  = (base_h + 0.60 * speech_drive) * talk_boost
             amp_b  = (base_b + 0.60 * speech_drive) * talk_boost
 
-            # Speech-synced nod/bob
             nod = (8.0 * speech_drive * np.sin(2*np.pi*2.2 * t)) if talking else 0.0
             bob = (5.0 * speech_drive * np.sin(2*np.pi*1.8 * t + 0.3)) if talking else 0.0
 
@@ -1030,7 +1026,6 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
             by_t = body_center[1] + VTS_BODY_SCALE_L * (amp_b * (sway_by*0.5 + by_n*0.5) + bob * 0.35)
             bz_t = body_center[2] + VTS_BODY_SCALE_L * (amp_b * (sway_bz*0.5 + bz_n*0.5))
 
-            # Smooth and clamp to rig limits
             m  = float(np.clip(mouth_s.update(dt, mouth_target), MOUTH_MIN, MOUTH_MAX))
             hx = float(np.clip(head_x_s.update(dt, hx_t), -30.0, 30.0))
             hy = float(np.clip(head_y_s.update(dt, hy_t), -30.0, 30.0))
@@ -1077,10 +1072,9 @@ async def motion_consumer(frame_queue: asyncio.Queue, samplerate: int):
         except Exception:
             pass
 
-# --- Streaming WAV parser ----------------------------------------------------
+# --- Streaming WAV parser (unused in this build, kept for reference) --------
 
 class StreamingWavToFrames:
-    """Incrementally parse a WAV byte stream and emit fixed-size float32 frames."""
     def __init__(self, target_sr: int, frame_ms: int):
         self.buf = bytearray()
         self.header_done = False
@@ -1089,7 +1083,6 @@ class StreamingWavToFrames:
         self.sr = target_sr
         self.frame_samples = max(1, int(target_sr * (frame_ms / 1000.0)))
         self.pcm_accum = np.zeros((0,), dtype=np.float32)
-
     def _parse_header(self) -> bool:
         b = self.buf
         if len(b) < 44:
@@ -1109,7 +1102,7 @@ class StreamingWavToFrames:
                 sr = int.from_bytes(b[j+4:j+8], "little")
                 bits = int.from_bytes(b[j+14:j+16], "little")
                 if audio_format != 1:
-                    return False  # PCM only
+                    return False
                 self.channels = ch
                 self.bits = bits
                 self.sr = sr
@@ -1123,15 +1116,13 @@ class StreamingWavToFrames:
         del self.buf[:data_ofs]
         self.header_done = True
         return True
-
     def push_bytes(self, chunk: bytes) -> List[np.ndarray]:
-        """Feed new bytes, return any whole frames now available."""
         self.buf += chunk
         frames: List[np.ndarray] = []
         if not self.header_done and not self._parse_header():
             return frames
         if self.bits != 16:
-            return frames  # only 16-bit PCM here
+            return frames
         bytes_per_samp = self.bits // 8
         n_samp_total = len(self.buf) // bytes_per_samp
         n_frames_interleaved = n_samp_total // self.channels
@@ -1153,9 +1144,7 @@ class StreamingWavToFrames:
             i += self.frame_samples
         self.pcm_accum = arr[i:]
         return frames
-
     def flush_tail(self) -> List[np.ndarray]:
-        """Pad and flush any remaining partial frame."""
         frames: List[np.ndarray] = []
         if self.pcm_accum.size:
             pad = np.zeros((self.frame_samples - self.pcm_accum.size,), dtype=np.float32)
@@ -1166,36 +1155,37 @@ class StreamingWavToFrames:
 # --- LLM → TTS → paced playback → motion ------------------------------------
 
 async def run_pipeline(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncClient, user_text: str):
-    """
-    Build persona/system + history, stream from LLM, chunk on punctuation
-    or stalls, synth each chunk, decode to frames, and feed audio at a
-    fixed cadence so the motion tap stays aligned.
-    """
     history = load_memory()
-    system_prompt = build_system_prompt(PERSONA)
-    fewshot = build_fewshot_block()
-    prompt = fewshot + build_prompt_with_history(user_text, history)
+
+    # ---------- FAST PASS (short prompt → faster TTFT) ----------
+    fast_on = FAST_FIRST_ENABLED
+    system_fast = build_system_prompt(PERSONA, fast=True) if fast_on else build_system_prompt(PERSONA, fast=False)
+    fewshot_fast = build_fewshot_block(fast=True) if fast_on else build_fewshot_block(fast=False)
+    prompt_fast = fewshot_fast + build_prompt_with_history(user_text, history, fast=True if fast_on else False)
 
     url = f"{OLLAMA_ENDPOINT}/api/generate"
-    req = {
+    req_fast = {
         "model": OLLAMA_MODEL,
-        "prompt": f"{system_prompt}\n\n{prompt}",
+        "prompt": f"{system_fast}\n\n{prompt_fast}",
         "stream": True,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": OLLAMA_TEMP, "top_p": OLLAMA_TOP_P,
-            "num_ctx": OLLAMA_NUM_CTX, "num_predict": OLLAMA_NUM_PREDICT,
+            "num_ctx": (FAST_NUM_CTX if fast_on else OLLAMA_NUM_CTX),
+            "num_predict": OLLAMA_NUM_PREDICT,
             "stop": ["\nUser:", "\nAssistant:", "\nSYSTEM:"]
         },
     }
 
+    # Reuse your existing audio writer exactly as-is
     audio_cb = _MOTION["audio"]; out_sr = _MOTION["sr"]
     fs = max(1, int(out_sr * (CHUNK_MS / 1000.0)))
     silent_frame = np.zeros((fs,), dtype=np.float32)
     def _push_audio(fr: np.ndarray): audio_cb.ring.push(fr)
 
     async def feed_frames_paced(frames: List[np.ndarray], postroll_ms: int):
-        """Emit frames at CHUNK_MS cadence + a short tail."""
+        _push_audio(silent_frame.copy())
+        await asyncio.sleep(CHUNK_MS / 1000.0)
         for fr in frames:
             _push_audio(fr)
             await asyncio.sleep(CHUNK_MS / 1000.0)
@@ -1205,22 +1195,20 @@ async def run_pipeline(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncCli
             _push_audio(zeros)
             await asyncio.sleep(CHUNK_MS / 1000.0)
 
-    audio_feed_lock = asyncio.Lock()  # serialize per-reply feed
-    first_tts = None
+    audio_feed_lock = asyncio.Lock()
+    first_tts: Optional[float] = None           # when first audio frames were queued
+    first_token_ts: Optional[float] = None      # when first LLM token arrived
     buf = ""
     parts: List[str] = []
     t0 = time.time()
     last_emit_ts = time.time()
 
     async def synth_and_stream(text_piece: str, postroll_ms: int):
-        """TTS one chunk, decode WAV to frames, and feed paced."""
         nonlocal first_tts
         clean = sanitize_text(text_piece)
         if not clean:
             return
         try:
-            _push_audio(silent_frame.copy())  # tiny preroll gap
-
             r = await client_tts.post(
                 TTS_URL, json={"text": clean},
                 timeout=httpx.Timeout(HTTP_READ_S, connect=HTTP_CONNECT_S)
@@ -1229,9 +1217,7 @@ async def run_pipeline(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncCli
             body = r.content or b""
             if len(body) < 64 or not body.startswith(b"RIFF"):
                 print(f"[TTS] Bad/short WAV (len={len(body)})."); return
-
             frames = await asyncio.to_thread(decode_wav_to_frames, body, out_sr, fs)
-
             async with audio_feed_lock:
                 await feed_frames_paced(frames, postroll_ms)
                 if first_tts is None and frames:
@@ -1241,47 +1227,75 @@ async def run_pipeline(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncCli
             print(f"[TTS] POST failed ({type(e_post).__name__}): {e_post}")
 
     tts_tasks: List[asyncio.Task] = []
+
+    # Shared clause flushing (unchanged logic)
+    def _maybe_flush(now: float):
+        nonlocal buf, last_emit_ts
+        boundary_idx = -1
+        if len(buf) >= max(SENT_MIN_CHARS, EARLY_FLUSH_MIN_CHARS):
+            boundary_idx = find_last_safe_boundary(buf)
+        if boundary_idx > 0:
+            s = buf[:boundary_idx].strip()
+            buf = buf[boundary_idx:]
+            last_emit_ts = now
+            if s:
+                parts.append(s)
+                tts_tasks.append(asyncio.create_task(
+                    synth_and_stream(s, postroll_ms=INTER_SENTENCE_GAP_MS)
+                ))
+            return True
+        stalled_ms = (now - last_emit_ts) * 1000.0
+        if stalled_ms >= EARLY_FLUSH_MAX_STALL_MS:
+            boundary_idx = find_last_safe_boundary(buf)
+            if boundary_idx > 0:
+                s = buf[:boundary_idx].strip()
+                buf = buf[boundary_idx:]
+                last_emit_ts = now
+                if s:
+                    parts.append(s)
+                    tts_tasks.append(asyncio.create_task(
+                        synth_and_stream(s, postroll_ms=INTER_SENTENCE_GAP_MS)
+                    ))
+                return True
+        HARD_CAP = max(200, 3 * max(SENT_MIN_CHARS, EARLY_FLUSH_MIN_CHARS))
+        if len(buf) > HARD_CAP:
+            cut = buf.rfind(" ", 0, HARD_CAP)
+            if cut > 0 and cut >= HARD_CAP * 0.6:
+                s = buf[:cut].strip()
+                buf = buf[cut+1:]
+                last_emit_ts = now
+                if s:
+                    parts.append(s)
+                    tts_tasks.append(asyncio.create_task(
+                        synth_and_stream(s, postroll_ms=INTER_SENTENCE_GAP_MS)
+                    ))
+                return True
+        return False
+
+    # -------- stream the fast-pass --------
+    t_open = time.time()
     try:
-        async with client_llm.stream("POST", url, json=req,
+        async with client_llm.stream("POST", url, json=req_fast,
                                      timeout=httpx.Timeout(HTTP_READ_S, connect=HTTP_CONNECT_S)) as resp:
             async for line in resp.aiter_lines():
-                if not line: continue
-                try: data = json.loads(line)
-                except Exception: continue
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
                 chunk = (data.get("response") or "")
+                if chunk and first_token_ts is None:
+                    first_token_ts = time.time()
                 if chunk:
                     buf += chunk
                     now = time.time()
-                    should_flush = False
-
-                    # Flush on punctuation or if we've stalled long enough
-                    if len(buf) >= max(SENT_MIN_CHARS, EARLY_FLUSH_MIN_CHARS) and re.search(r'[.!?;,]\s+', buf):
-                        should_flush = True
-                    elif len(buf) >= EARLY_FLUSH_MIN_CHARS and (now - last_emit_ts) * 1000.0 >= EARLY_FLUSH_MAX_STALL_MS:
-                        should_flush = True
-
-                    if should_flush:
-                        s = buf.strip(); buf = ""; last_emit_ts = now
-                        if s:
-                            parts.append(s)
-                            tts_tasks.append(asyncio.create_task(
-                                synth_and_stream(s, postroll_ms=INTER_SENTENCE_GAP_MS)
-                            ))
-
-                if data.get("done"):
-                    break
-
-        tail = buf.strip()
-        if tail:
-            parts.append(tail)
-            tts_tasks.append(asyncio.create_task(
-                synth_and_stream(tail, postroll_ms=POSTROLL_MS)
-            ))
+                    _maybe_flush(now)
     finally:
+        # let TTS tasks drain
         if tts_tasks:
             try: await asyncio.gather(*tts_tasks, return_exceptions=True)
             except Exception: pass
-        # Small closing pad; then let PortAudio drain
         for _ in range(max(1, int(POSTROLL_MS / CHUNK_MS))):
             _push_audio(silent_frame.copy())
             await asyncio.sleep(CHUNK_MS / 1000.0)
@@ -1290,14 +1304,30 @@ async def run_pipeline(client_llm: httpx.AsyncClient, client_tts: httpx.AsyncCli
 
     reply = " ".join(parts).strip()
     history.append({"user": user_text, "assistant": reply}); save_memory(history)
+
+    # Timing: what actually cost us?
     if LATENCY_REPORT:
-        if first_tts: print(f"[TIMINGS] LLM_total={time.time()-t0:.2f}s FirstSpeech={(first_tts-t0):.2f}s")
-        else: print(f"[TIMINGS] LLM_total={time.time()-t0:.2f}s")
+        total = time.time() - t0
+
+        # Derive values
+        ttft_val = (first_token_ts - t_open) if (first_token_ts is not None) else None
+        first_audio_val = (first_tts - t0) if (first_tts is not None) else None
+
+        # Pretty strings (avoid format-spec inside conditionals)
+        open_str = f"{(t_open - t0):.2f}s"
+        ttft_str = f"{ttft_val:.2f}s" if ttft_val is not None else "n/a"
+        first_audio_str = f"{first_audio_val:.2f}s" if first_audio_val is not None else "n/a"
+        total_str = f"{total:.2f}s"
+
+        print(f"[TIMINGS] open={open_str} TTFT={ttft_str} FirstAudio={first_audio_str} Total={total_str}")
+
+
+
+
 
 # --- VTS self-test -----------------------------------------------------------
 
 async def vts_motion_self_test(duration_s: float = 2.5):
-    """Quick param sweep so we know VTS is alive before the motion loop."""
     vts = await get_vts()
     if not vts or not vts.authed:
         print("[VTS] self-test aborted: VTS not authed."); return
@@ -1330,23 +1360,26 @@ async def vts_motion_self_test(duration_s: float = 2.5):
 # --- Main --------------------------------------------------------------------
 
 async def main():
-    """Bring up listeners, warm dependencies, run the PTT loop."""
     start_ptt_listener()
 
     print("[BOOT] Loading ASR...")
-    asr = await asyncio.to_thread(ASREngine)  # load off the loop
+    asr = await asyncio.to_thread(ASREngine)
 
-    async with httpx.AsyncClient() as client_llm, httpx.AsyncClient() as client_tts:
+    # Reused HTTP/2 clients with keep-alive + tight limits
+    llm_limits = httpx.Limits(max_keepalive_connections=2, max_connections=5)
+    tts_limits = httpx.Limits(max_keepalive_connections=2, max_connections=5)
+
+    async with httpx.AsyncClient(http2=True, limits=llm_limits, timeout=httpx.Timeout(HTTP_READ_S, connect=HTTP_CONNECT_S), headers={"Connection":"keep-alive"}, trust_env=False) as client_llm, \
+               httpx.AsyncClient(http2=True, limits=tts_limits, timeout=httpx.Timeout(HTTP_READ_S, connect=HTTP_CONNECT_S), headers={"Connection":"keep-alive"}, trust_env=False) as client_tts:
+
         print("[BOOT] Warming up LLM/TTS/ASR...")
         await warmup(client_llm, client_tts, asr)
 
-        # Do a quick VTS sweep before starting the motion loop
         try:
             await vts_motion_self_test()
         except Exception as e:
             print(f"[VTS] self-test error: {e!r}")
 
-        # Start the shared audio output + motion tap
         out_sr = _MOTION["sr"]
         _MOTION["queue"] = asyncio.Queue(maxsize=FRAME_QUEUE_MAX)
         _MOTION["audio"] = CallbackOutput(out_sr, frame_ms=CHUNK_MS)
@@ -1372,7 +1405,6 @@ async def main():
         except KeyboardInterrupt:
             print("\n👋 Bye.")
         finally:
-            # Graceful shutdown
             try:
                 if _MOTION["queue"] is not None:
                     await _MOTION["queue"].put(None)
